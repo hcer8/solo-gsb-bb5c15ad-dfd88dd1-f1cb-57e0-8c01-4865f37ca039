@@ -61,6 +61,15 @@ delta_cap 与已入账申请、预留均不变。来源转出后上限必须仍�
 试算**严格只读**：不创建申请、预留或任何裁定记录，也不触发预留惰性清扫；
 重复调用始终按最新账本重新计算。
 
+另提供**只读的数据集隐私成本归因（cost attribution）**：
+`POST /datasets/{dataset_id}/cost-attributions` 一次提交 **1～10 个互不重复**
+的 `request_id`，仅允许选取**本数据集内已授权且未冲正**的申请。服务以
+「**其余**未冲正已授权申请 + 当前**未到期**有效预留」为基线，复用既有 RDP
+口径投影所选申请的**所有子集**的组合 epsilon，按各申请加入子集时的边际增量
+与**标准 Shapley 权重**分摊该组造成的增量。响应返回基线占用、全组选入占用、
+逐项分摊值与分摊总和；分摊总和在数值误差内**恒等于两次占用之差**。接口
+**严格只读、按实时账本重算**：不写任何记录、不触发预留惰性清扫（不清扫预留）。
+
 ---
 
 ## 1. 快速启动（Docker Compose）
@@ -156,6 +165,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/datasets/{dataset_id}/requests` | 提交分析申请（幂等） |
 | `GET` | `/datasets/{dataset_id}/requests` | 全部申请记录（含 granted / rejected，并标明是否已冲正） |
 | `POST` | `/datasets/{dataset_id}/selection-plans` | **只读**试算：穷举 1～12 个候选的可行子集，返回总 value 最大的组合（不落库） |
+| `POST` | `/datasets/{dataset_id}/cost-attributions` | **只读**：对 1～10 个已授权未冲正申请按标准 Shapley 权重分摊其组合 epsilon 增量（不落库、不清扫预留） |
 | `POST` | `/datasets/{dataset_id}/request-batches` | 原子提交 2～20 项分析批次（整批批准或整批拒绝，按 `batch_id` 幂等） |
 | `GET` | `/datasets/{dataset_id}/request-batches/{batch_id}` | 按 `batch_id` 查询批次裁定与各项当时的组合值 |
 | `POST` | `/datasets/{dataset_id}/requests/{request_id}/reversals` | 冲正一条已授权且未冲正的申请（按 `reversal_id` 幂等） |
@@ -858,6 +868,107 @@ curl -X POST http://localhost:8000/datasets/sales-2026/selection-plans \
 * 候选数为 0 或超过 12、`candidate_id` 重复或为空、`epsilon` / `delta` 越界、
   `value` 非正整数（含小数）等 → `422`。
 
+### 4.16 数据集隐私成本归因（cost attribution，只读）
+
+在**不创建、不改写任何记录**的前提下，把一组已授权申请**一起叠加到当前
+账本时造成的组合 epsilon 增量**，按标准 **Shapley 值**在该组各申请之间公平
+分摊。基线占用为「**其余**全部 granted 且未冲正的申请 ∪ 全部**未到期**
+granted 预留」——即当前账本占用扣除所选申请自身；所选申请的每个子集都在该
+基线之上用**与正式准入完全相同的 RDP 口径**投影一次。
+
+```bash
+curl -X POST http://localhost:8000/datasets/sales-2026/cost-attributions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_ids": [
+      "req-20260924-0001",
+      "req-20260924-0002",
+      "req-20260924-0003"
+    ]
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `request_ids` | array | 必填，**1～10 个**，互不重复；每个为 1–200 字符的 `request_id`（字母/数字/`.`/`_`/`-`），且必须是**本数据集**内已授权（granted）且**未冲正**的申请 |
+
+分摊口径：设基线（其余申请 + 有效预留）的组合投影为价值函数的背景，
+`v(S)` 为基线上再叠加子集 `S` 后投影出的组合 epsilon，则每个所选申请 `i`
+的分摊值为其在均匀联盟次序下的期望边际增量（标准 Shapley 权重）：
+
+```
+φ_i = Σ_{S ⊆ N∖{i}} |S|! (n − |S| − 1)! / n!  · (v(S ∪ {i}) − v(S))
+```
+
+由于各边际项在排列上望远镜式相消，`Σ_i φ_i = v(N) − v(∅)`，因此**逐项分摊
+之和恒等于「全组选入占用 − 基线占用」**（允许浮点误差）；纯 ε-DP 申请的
+边际与其所在联盟无关，分摊值恰为各自的 epsilon；近似 DP 申请因 RDP 转换的
+非线性，边际随联盟中其他申请变化，由 Shapley 平均体现协同效应。投影使用与
+预算视图、准入判定同一张 RDP orders 网格（纯 ε-DP 仍走精确可加分支）。
+
+成功返回 `200`：
+
+```json
+{
+  "dataset_id": "sales-2026",
+  "generated_at": "2026-09-24T10:00:00.000000Z",
+  "request_count": 3,
+  "request_ids": ["req-20260924-0001", "req-20260924-0002", "req-20260924-0003"],
+  "epsilon_cap": 1.0,
+  "epsilon_baseline": 0.1123,
+  "rdp_best_order_baseline": 8192.0,
+  "epsilon_projected": 0.4567,
+  "rdp_best_order_projected": 8192.0,
+  "epsilon_increment": 0.3444,
+  "epsilon_attributed_total": 0.3444,
+  "items": [
+    {"request_id": "req-20260924-0001", "epsilon": 0.1, "delta": 1e-8,
+     "epsilon_attributed": 0.1082},
+    {"request_id": "req-20260924-0002", "epsilon": 0.2, "delta": 1e-8,
+     "epsilon_attributed": 0.1965},
+    {"request_id": "req-20260924-0003", "epsilon": 0.05, "delta": 0.0,
+     "epsilon_attributed": 0.05}
+  ]
+}
+```
+
+字段说明：
+
+* `request_ids`：按请求提交顺序原样回显；`items` 顺序与之一一对应；
+* `epsilon_baseline`：**其余**未冲正已授权申请 + 当前未到期有效预留的组合
+  投影 epsilon（`rdp_best_order_baseline` 为其最优 RDP order）；
+* `epsilon_projected`：基线**再叠加全部所选申请**后的组合投影 epsilon
+  （`rdp_best_order_projected` 为其最优 order）；
+* `epsilon_increment`：`epsilon_projected − epsilon_baseline`（不为负），即
+  该组申请一起造成的增量；
+* `items[].epsilon_attributed`：该申请的标准权重 Shapley 分摊值；
+* `epsilon_attributed_total`：各 `epsilon_attributed` 之和，在数值误差内
+  等于 `epsilon_increment`。
+
+语义与边界：
+
+* **严格只读、无幂等键**：与释放预测 / 组合试算相同，本接口仅执行纯
+  SELECT，不写任何表（不产生申请、预留、批次、转拨或冲正记录），也
+  **不触发预留惰性清扫（不清扫预留）**；因此没有 `idempotent_replay`
+  字段，**每次调用都按最新已提交账本实时重算**——账本被其他申请 / 预留 /
+  冲正 / 转拨改变后，再次归因的基线与分摊值都可能变化；
+* 归因只是核算视角：所选申请**不会**被移除、复制或重新准入，预留状态也
+  不受影响；分摊值不改变任何已记录的准入裁定；
+* 至多 10 个申请（2¹⁰ = 1024 个子集投影，单次调用即可完成）。
+
+错误情况：
+
+* 数据集不存在 → `404 dataset_not_found`；
+* 任一 `request_id` 在本数据集内不存在（即使其余合法）→
+  `404 request_not_found`（响应给出缺失的 `request_id`）；
+* 任一所选申请为 `rejected` → `409 request_not_granted`；
+* 任一所选申请**已冲正** → `409 request_already_reversed`（detail 给出已有
+  冲正的 `reversal_id`）；
+* `request_ids` 为 0 个或超过 10 个、含重复 ID、ID 为空或含非法字符、
+  缺少字段等 → `422`。
+
 ---
 
 ## 5. RDP 组合会计（核算口径）
@@ -903,6 +1014,15 @@ curl -X POST http://localhost:8000/datasets/sales-2026/selection-plans \
    **同一条** RDP 投影（纯 ε-DP 仍走精确可加分支），仅保留投影不超 cap 的
    可行子集并按「总 value → 投影 epsilon → 候选 ID 升序列表字典序」选优；
    全程纯 SELECT，不落任何记录、不做惰性清扫，重复调用按最新账本重算。
+
+8. 成本归因（cost attribution）同样**不改变任何集合**：基线为「未冲正已授权
+   申请集合扣除所选组 ∪ 未到期预留」，价值函数 `v(S)` 是该基线上叠加所选组
+   子集 `S` 后的**同一条** RDP 组合投影（与准入、预算视图同一张 orders 网格、
+   同一纯 ε-DP 精确可加分支）；对 1～10 个所选申请穷举全部 2ⁿ 个子集后，按
+   标准 Shapley 权重 `|S|!(n−|S|−1)!/n!` 对边际 `v(S∪{i})−v(S)` 求期望。
+   望远镜恒等式保证逐项分摊之和恰为 `v(N)−v(∅)`（全组占用减基线占用），实现
+   中仅余浮点舍入误差；全程纯 SELECT，不落记录、不做惰性清扫，重复调用按
+   最新账本重算。
 
 特殊情形：
 
@@ -950,8 +1070,9 @@ curl -X POST http://localhost:8000/datasets/sales-2026/selection-plans \
   “先到先得、额满即拒”；
 * TTL 过期为**惰性**处理：任何读写路径进入临界区时先把到期预留标记为
   `expired` 再计算额度，因此过期预留既不会继续占额，也不会被重复确认。
-* 只读的候选组合试算（selection plan）与释放预测一样**不进入写临界区、不开启
-  写事务**：仅用纯 SELECT 读取未冲正申请与未到期预留后在进程内穷举子集，
+* 只读的候选组合试算（selection plan）、释放预测与成本归因（cost
+  attribution）一样**不进入写临界区、不开启写事务**：仅用纯 SELECT 读取未冲正
+  申请与未到期预留后在进程内穷举子集 / 计算 Shapley 分摊，
   与任何并发写互不阻塞，也绝不改变数据库状态。
 
 ---
@@ -1037,6 +1158,17 @@ confirmed、其他有效预留继续计入并仍能阻止超额新申请、到�
 清扫、重复调用结果稳定）、账本变化后再次试算按最新占用重算、12 项边界、缺失
 数据集 404、0 / 13 项、重复 `candidate_id`、`value` 非正整数（含小数）与
 epsilon/delta 越界 422。
+
+隐私成本归因测试另覆盖：单项归因即其边际增量、纯 ε-DP 组各项分摊恰为自身
+epsilon、基线只保留组外申请与有效预留（组内按 request_id 身份剔除而非按
+(ε,δ) 值）、相同机制分摊相同（Shapley 对称性）、混合纯 / 近似 DP 的 4 项组
+用 `rdp.py` 独立穷举全部 16 个子集交叉校验基线、全组占用与逐项标准权重
+Shapley 分摊、未到期预留计入基线且全组占用与预算视图 committed 一致、已过期
+预留与已冲正申请不参与、10 项边界、严格只读（不产生任何记录、不触发惰性
+清扫、重复调用结果稳定）、账本新增申请与冲正后基线实时重算、逐项分摊总和
+在 `1e-10` 内等于全组与基线占用之差，以及缺失数据集 / 缺失申请（含多选中
+一个缺失）404、被拒绝 / 已冲正申请 409、重复 ID / 0 项 / 11 项 / 非法字符 /
+缺字段 422。
 
 ---
 

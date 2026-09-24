@@ -649,5 +649,94 @@ class SelectionPlanView(BaseModel):
     rdp_best_order: float
 
 
+# -------------------------------------------------------- cost attribution --
+
+
+# A read-only Shapley attribution enumerates every subset of the selected
+# group, so its size is capped tightly (2**10 = 1024 subsets at most).
+MIN_COST_ATTRIBUTION_REQUESTS = 1
+MAX_COST_ATTRIBUTION_REQUESTS = 10
+
+
+class CostAttributionRequest(BaseModel):
+    """1-10 unique granted, non-reversed requests to attribute cost between."""
+
+    request_ids: list[str] = Field(
+        ...,
+        min_length=MIN_COST_ATTRIBUTION_REQUESTS,
+        max_length=MAX_COST_ATTRIBUTION_REQUESTS,
+        examples=[["req-20260924-0001", "req-20260924-0002"]],
+        description="Existing granted, non-reversed request_ids of this "
+        "dataset; 1-10 entries, all distinct.",
+    )
+
+    @field_validator("request_ids")
+    @classmethod
+    def _valid_ids(cls, v: list[str]) -> list[str]:
+        for rid in v:
+            if not (1 <= len(rid) <= 200) or not _DATASET_ID_PATTERN.fullmatch(rid):
+                raise ValueError(
+                    "each request_id may contain only letters, digits, '.', "
+                    "'_' and '-' and be 1-200 characters long"
+                )
+        return v
+
+    @model_validator(mode="after")
+    def _unique_request_ids(self) -> "CostAttributionRequest":
+        seen: set[str] = set()
+        for rid in self.request_ids:
+            if rid in seen:
+                raise ValueError(
+                    f"request_id {rid!r} occurs more than once; request_ids "
+                    "must be unique within the request"
+                )
+            seen.add(rid)
+        return self
+
+
+class CostAttributionItem(BaseModel):
+    """One selected request's Shapley share of the group's epsilon increment."""
+
+    request_id: str
+    epsilon: float
+    delta: float
+    epsilon_attributed: float
+
+
+class CostAttributionView(BaseModel):
+    """Read-only Shapley cost attribution for a group of granted requests.
+
+    The baseline occupancy composes every *other* granted, non-reversed
+    request and every currently non-expired granted reservation; the full
+    group is then projected on top under the existing RDP rules.  Each
+    selected request is charged its expected marginal projected-epsilon
+    increment (standard Shapley weights) over uniform coalition orderings, so
+    the per-item shares sum, within numerical error, to the full group's
+    increment.  Nothing is persisted: no request, reservation, reversal or
+    any other record is created, the lazy reservation sweep never runs, and
+    every call recomputes against the latest committed ledger state.
+    """
+
+    dataset_id: str
+    generated_at: datetime
+    request_count: int
+    # Selected ids, echoed in the exact order supplied by the caller.
+    request_ids: list[str]
+    epsilon_cap: float
+    # Composed epsilon occupied by every other non-reversed granted request
+    # plus non-expired granted reservations.
+    epsilon_baseline: float
+    rdp_best_order_baseline: float
+    # Composed epsilon projected with the whole selected group added.
+    epsilon_projected: float
+    rdp_best_order_projected: float
+    # epsilon_projected - epsilon_baseline.
+    epsilon_increment: float
+    # Sum of the per-item Shapley shares; equals epsilon_increment within
+    # floating-point error.
+    epsilon_attributed_total: float
+    items: list[CostAttributionItem]
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)

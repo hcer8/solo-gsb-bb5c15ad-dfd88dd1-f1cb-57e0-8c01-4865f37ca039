@@ -16,6 +16,8 @@ from .schemas import (
     BatchVerdict,
     BudgetTransferRequest,
     BudgetTransferView,
+    CostAttributionRequest,
+    CostAttributionView,
     DatasetInfo,
     DatasetRegister,
     ReleaseForecast,
@@ -88,7 +90,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -117,7 +119,16 @@ app = FastAPI(
         "highest-value subset (ties broken by smaller projected epsilon, then "
         "ascending candidate-id lexicographic order) with the remaining budget, "
         "and never creates requests, reservations or verdict records -- "
-        "repeated calls recompute against the latest ledger.  Finally, a "
+        "repeated calls recompute against the latest ledger.  A read-only "
+        "cost-attribution endpoint also accepts 1-10 distinct request_ids of "
+        "granted, non-reversed requests of one dataset: taking the other "
+        "non-reversed granted requests and currently non-expired reservations "
+        "as the baseline, it projects every subset of the selected group under "
+        "the existing RDP rules and charges each request its standard-weight "
+        "Shapley share of the group's projected-epsilon increment, so the "
+        "per-item shares sum (within numerical error) to the difference "
+        "between the full-group and baseline occupancy; nothing is persisted "
+        "and reservations are never swept.  Finally, a "
         "granted analysis request can be reversed with a globally unique "
         "reversal_id and reason: the original verdict and reservation history "
         "stay untouched while an immutable reversal record removes the request "
@@ -299,6 +310,19 @@ async def _batch_item_duplicate(
     )
 
 
+@app.exception_handler(db.CostAttributionStateConflict)
+async def _cost_attribution_state_conflict(
+    _: Request, exc: db.CostAttributionStateConflict
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "error": exc.args[0],
+            "detail": exc.args[1],
+        },
+    )
+
+
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -376,6 +400,18 @@ async def create_selection_plan(
     dataset_id: DATASET_ID, payload: SelectionPlanRequest
 ) -> dict:
     return await ledger.selection_plan(dataset_id, payload.candidates)
+
+
+@app.post(
+    "/datasets/{dataset_id}/cost-attributions",
+    response_model=CostAttributionView,
+    tags=["cost-attributions"],
+    summary="Attribute a group's projected epsilon cost with Shapley shares (read-only)",
+)
+async def create_cost_attribution(
+    dataset_id: DATASET_ID, payload: CostAttributionRequest
+) -> dict:
+    return await ledger.cost_attribution(dataset_id, payload.request_ids)
 
 
 @app.get(

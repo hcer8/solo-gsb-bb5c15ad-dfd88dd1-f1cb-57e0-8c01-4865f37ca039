@@ -278,6 +278,13 @@ class BatchItemDuplicate(Exception):
     """
 
 
+class CostAttributionStateConflict(Exception):
+    """A selected request is rejected or already reversed (HTTP 409).
+
+    ``args[0]`` carries an API error code, ``args[1]`` the human detail.
+    """
+
+
 # -------------------------------------------------------------- connection --
 
 
@@ -402,6 +409,27 @@ async def list_granted_entries(
     ) as cur:
         rows = await cur.fetchall()
     return [(row[0], row[1]) for row in rows]
+
+
+async def list_granted_request_rows(
+    db: aiosqlite.Connection, dataset_id: str
+) -> list[aiosqlite.Row]:
+    """Granted, non-reversed requests as rows (read-only, no writes).
+
+    Mirrors :func:`list_granted_entries` but keeps the ``request_id`` so
+    read-only projections (cost attribution) can remove a specific subset by
+    identity instead of by ``(epsilon, delta)`` value.
+    """
+    async with db.execute(
+        "SELECT r.request_id, r.epsilon, r.delta FROM requests r "
+        "WHERE r.dataset_id = ? AND r.status = 'granted' "
+        "AND NOT EXISTS ( "
+        "    SELECT 1 FROM request_reversals x "
+        "    WHERE x.dataset_id = r.dataset_id AND x.request_id = r.request_id "
+        ") ORDER BY r.id",
+        (dataset_id,),
+    ) as cur:
+        return await cur.fetchall()
 
 
 async def list_active_reservation_entries(
