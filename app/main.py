@@ -16,6 +16,8 @@ from .schemas import (
     BatchVerdict,
     BudgetTransferRequest,
     BudgetTransferView,
+    CostAttributionRequest,
+    CostAttributionView,
     DatasetInfo,
     DatasetRegister,
     ReleaseForecast,
@@ -88,7 +90,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -117,7 +119,16 @@ app = FastAPI(
         "highest-value subset (ties broken by smaller projected epsilon, then "
         "ascending candidate-id lexicographic order) with the remaining budget, "
         "and never creates requests, reservations or verdict records -- "
-        "repeated calls recompute against the latest ledger.  Finally, a "
+        "repeated calls recompute against the latest ledger.  A read-only "
+        "cost-attribution endpoint additionally accepts 1-10 distinct granted, "
+        "non-reversed request_ids: it takes the other non-reversed granted "
+        "requests plus the currently non-expired reservations as the baseline, "
+        "projects every subset of the selected group with the same RDP "
+        "accounting, and splits the group's epsilon increment between the "
+        "selected requests by each one's marginal increment under standard "
+        "Shapley weights, returning the baseline and full-group occupancy "
+        "alongside the per-request shares and their exact-sum total; it "
+        "creates no records and never sweeps reservations.  Finally, a "
         "granted analysis request can be reversed with a globally unique "
         "reversal_id and reason: the original verdict and reservation history "
         "stay untouched while an immutable reversal record removes the request "
@@ -376,6 +387,18 @@ async def create_selection_plan(
     dataset_id: DATASET_ID, payload: SelectionPlanRequest
 ) -> dict:
     return await ledger.selection_plan(dataset_id, payload.candidates)
+
+
+@app.post(
+    "/datasets/{dataset_id}/cost-attributions",
+    response_model=CostAttributionView,
+    tags=["cost-attributions"],
+    summary="Attribute a granted-request group's epsilon increment (read-only)",
+)
+async def create_cost_attribution(
+    dataset_id: DATASET_ID, payload: CostAttributionRequest
+) -> dict:
+    return await ledger.cost_attribution(dataset_id, payload)
 
 
 @app.get(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -13,6 +14,7 @@ from .schemas import (
     AnalysisRequest,
     BatchAnalysisRequest,
     BudgetTransferRequest,
+    CostAttributionRequest,
     DatasetRegister,
     MAX_EPSILON_CAP,
     ReversalCreate,
@@ -1441,3 +1443,192 @@ async def transfer_budget(
 
             row = await db.get_budget_transfer(conn, payload.transfer_id)
             return _transfer_view_from_row(row, replay=False), 201
+
+
+# -------------------------------------------------------- cost attributions --
+
+
+async def cost_attribution(
+    dataset_id: str, payload: CostAttributionRequest
+) -> dict[str, Any]:
+    """Read-only Shapley attribution of the group increment of selected requests.
+
+    The baseline is composed from every *other* granted, non-reversed request
+    plus the granted reservations that have not expired *right now*.  For the
+    selected group, every subset is projected on top of the baseline using the
+    existing RDP accounting, and each selected request is charged its standard
+    Shapley share
+
+        phi_i = sum_{S subseteq N\\{i}} |S|! (n-1-|S|)! / n!
+                * ( V(S u {i}) - V(S) )
+
+    where ``V(S)`` is the composed projected epsilon of the baseline plus the
+    requests in subset ``S``.  Because RDP composition is additive, V is
+    monotone, so every marginal (and hence every share) is non-negative, and
+    the shares sum to ``V(N) - V({})`` up to floating-point round-off.
+
+    Like the release forecast and selection plan this path issues pure
+    SELECTs only: it never sweeps reservation expiry and never writes any
+    record, so repeated calls always recompute against the live ledger.
+    """
+    now = utcnow()
+    now_iso = now.isoformat()
+    selected_ids = payload.request_ids
+
+    async with db.connect() as conn:
+        dataset = await db.require_dataset(conn, dataset_id)
+        # Pure SELECTs only (no lazy expiry UPDATE), so the attribution is
+        # strictly read-only; reservations past their TTL simply do not
+        # qualify.
+        eligible_rows = await db.list_granted_request_rows(conn, dataset_id)
+        reservation_rows = await db.list_granted_reservation_rows(
+            conn, dataset_id, now_iso=now_iso
+        )
+        # Fetch the live row (granted/rejected, with or without a reversal)
+        # for each selected id so the validation reports 404/409 precisely.
+        selected_rows = [
+            await db.get_request(conn, dataset_id, request_id)
+            for request_id in selected_ids
+        ]
+        assert not conn.in_transaction
+
+    # Validate the whole selection against the live ledger.  A missing id is
+    # 404; a rejected or already-reversed id is 409, reported in request order.
+    by_id = {row["request_id"]: row for row in eligible_rows}
+    for request_id, row in zip(selected_ids, selected_rows):
+        if row is None:
+            raise db.RequestNotFound(request_id)
+        if row["status"] != "granted":
+            raise db.ReversalStateConflict(
+                "request_not_granted",
+                f"request {request_id!r} is {row['status']} and cannot be "
+                "attributed; only granted requests participate",
+            )
+        if request_id not in by_id:
+            # Granted but carrying a reversal row: already reversed.
+            raise db.ReversalStateConflict(
+                "request_already_reversed",
+                f"request {request_id!r} was already reversed and no longer "
+                "occupies any budget",
+            )
+
+    target_delta = dataset["delta_cap"]
+    cap = dataset["epsilon_cap"]
+
+    selected_set = set(selected_ids)
+    baseline_entries = [
+        (row["epsilon"], row["delta"])
+        for row in eligible_rows
+        if row["request_id"] not in selected_set
+    ]
+    baseline_entries.extend(
+        (row["epsilon"], row["delta"]) for row in reservation_rows
+    )
+
+    # Decompose the baseline composition once so each of the 2**n subset
+    # projections is a cheap per-order sum instead of recomposing the ledger.
+    base_pure = sum(eps for eps, d in baseline_entries if d == 0.0)
+    base_approx_curve = rdp.compose_rdp(
+        [
+            rdp.single_rdp_curve(eps, d)
+            for eps, d in baseline_entries
+            if d > 0.0
+        ]
+    )
+    n_orders = len(rdp.RDP_ORDERS)
+
+    selected = [by_id[request_id] for request_id in selected_ids]
+    sel_pure = [
+        row["epsilon"] if row["delta"] == 0.0 else 0.0 for row in selected
+    ]
+    sel_curves = [
+        rdp.single_rdp_curve(row["epsilon"], row["delta"])
+        if row["delta"] > 0.0
+        else None
+        for row in selected
+    ]
+    baseline_has_approx = any(d > 0.0 for _, d in baseline_entries)
+    n = len(selected)
+
+    def _project(mask: int) -> tuple[float, float]:
+        """Composed (epsilon, best_order) for baseline + the subset in mask."""
+        pure_sum = base_pure + sum(
+            sel_pure[i] for i in range(n) if mask & (1 << i)
+        )
+        approx_here = baseline_has_approx or any(
+            sel_curves[i] is not None for i in range(n) if mask & (1 << i)
+        )
+        if not approx_here:
+            if pure_sum == 0.0:
+                # Mirror evaluate_entries([]): no mechanisms at all.
+                return 0.0, rdp.RDP_ORDERS[-1]
+            # Exact pure-DP basic composition.
+            return pure_sum, rdp.RDP_ORDERS[0]
+        composed = list(base_approx_curve)
+        for i in range(n):
+            if mask & (1 << i):
+                curve = sel_curves[i]
+                if curve is not None:
+                    for j in range(n_orders):
+                        composed[j] += curve[j]
+        epsilon, order = rdp.rdp_to_approx_dp(composed, target_delta)
+        return max(0.0, pure_sum + epsilon), order
+
+    # Every coalition value exactly once; Shapley marginals read from this map.
+    values: dict[int, float] = {}
+    orders: dict[int, float] = {}
+    for mask in range(1 << n):
+        values[mask], orders[mask] = _project(mask)
+
+    baseline_epsilon = values[0]
+    full_epsilon = values[(1 << n) - 1]
+    baseline_order = orders[0]
+    full_order = orders[(1 << n) - 1]
+
+    attributions: list[dict[str, Any]] = []
+    total = 0.0
+    full_mask = (1 << n) - 1
+    for i, row in enumerate(selected):
+        bit = 1 << i
+        others = full_mask ^ bit
+        share = 0.0
+        # Enumerate every subset S of the other n-1 players as submasks.
+        sub = others
+        while True:
+            size = sub.bit_count()
+            weight = (
+                math.factorial(size)
+                * math.factorial(n - 1 - size)
+                / math.factorial(n)
+            )
+            marginal = values[sub | bit] - values[sub]
+            share += weight * marginal
+            if sub == 0:
+                break
+            sub = (sub - 1) & others
+        share = max(0.0, share)
+        total += share
+        attributions.append(
+            {
+                "request_id": row["request_id"],
+                "epsilon": row["epsilon"],
+                "delta": row["delta"],
+                "attributed_epsilon": share,
+            }
+        )
+
+    increment = max(0.0, full_epsilon - baseline_epsilon)
+    return {
+        "dataset_id": dataset_id,
+        "generated_at": now,
+        "request_count": n,
+        "request_ids": list(selected_ids),
+        "epsilon_cap": cap,
+        "epsilon_baseline": baseline_epsilon,
+        "epsilon_full_group": full_epsilon,
+        "epsilon_increment": increment,
+        "rdp_best_order_baseline": baseline_order,
+        "rdp_best_order_full_group": full_order,
+        "attributed_total_epsilon": total,
+        "attributions": attributions,
+    }

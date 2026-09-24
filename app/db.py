@@ -404,6 +404,31 @@ async def list_granted_entries(
     return [(row[0], row[1]) for row in rows]
 
 
+async def list_granted_request_rows(
+    db: aiosqlite.Connection, dataset_id: str
+) -> list[aiosqlite.Row]:
+    """Granted, non-reversed requests of this dataset (full rows), read-only.
+
+    Unlike :func:`list_active_reservation_entries` this performs *no* lazy
+    expiry UPDATE: strictly read-only accounting paths (cost attribution) use
+    it alongside :func:`list_granted_reservation_rows` without ever touching
+    reservation state.
+    """
+    async with db.execute(
+        "SELECT r.dataset_id, r.request_id, r.query_type, r.epsilon, r.delta, "
+        "r.status, r.reason, r.epsilon_before, r.epsilon_after, "
+        "r.rdp_best_order, r.created_at "
+        "FROM requests r "
+        "WHERE r.dataset_id = ? AND r.status = 'granted' "
+        "AND NOT EXISTS ( "
+        "    SELECT 1 FROM request_reversals x "
+        "    WHERE x.dataset_id = r.dataset_id AND x.request_id = r.request_id "
+        ") ORDER BY r.id",
+        (dataset_id,),
+    ) as cur:
+        return await cur.fetchall()
+
+
 async def list_active_reservation_entries(
     db: aiosqlite.Connection, dataset_id: str, *, now_iso: str
 ) -> list[tuple[float, float]]:

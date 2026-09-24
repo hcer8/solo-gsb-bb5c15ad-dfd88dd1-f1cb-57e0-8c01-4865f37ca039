@@ -61,6 +61,17 @@ delta_cap 与已入账申请、预留均不变。来源转出后上限必须仍�
 试算**严格只读**：不创建申请、预留或任何裁定记录，也不触发预留惰性清扫；
 重复调用始终按最新账本重新计算。
 
+最后提供**只读的隐私成本归因（cost attribution）**：
+`POST /datasets/{dataset_id}/cost-attributions` 接收 **1～10 个互不重复**的
+`request_id`，只允许选取本数据集内**已授权且未冲正**的申请（缺失 → `404`，
+已拒绝或已冲正 → `409`，`request_id` 重复或数量越界 → `422`）。服务以
+**其余**未冲正已授权申请与**当前未到期**的 granted 预留为基线，用同一套 RDP
+口径穷举所选申请的全部 2ⁿ 子集并计算每个子集的投影 epsilon，按各申请加入
+子集时的**边际增量**与**标准 Shapley 权重**
+`|S|!(n−1−|S|)!/n!` 分摊整组造成的增量；响应给出基线占用、全组选入占用、
+逐项分摊值与分摊总和（数值误差内恰等于两次占用之差）。归因**严格只读**：
+不写任何记录、不触发预留惰性清扫，每次调用都按实时账本重算。
+
 ---
 
 ## 1. 快速启动（Docker Compose）
@@ -156,6 +167,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/datasets/{dataset_id}/requests` | 提交分析申请（幂等） |
 | `GET` | `/datasets/{dataset_id}/requests` | 全部申请记录（含 granted / rejected，并标明是否已冲正） |
 | `POST` | `/datasets/{dataset_id}/selection-plans` | **只读**试算：穷举 1～12 个候选的可行子集，返回总 value 最大的组合（不落库） |
+| `POST` | `/datasets/{dataset_id}/cost-attributions` | **只读**：对 1～10 个已授权未冲正申请按 Shapley 边际增量分摊整组 epsilon 增量（不落库） |
 | `POST` | `/datasets/{dataset_id}/request-batches` | 原子提交 2～20 项分析批次（整批批准或整批拒绝，按 `batch_id` 幂等） |
 | `GET` | `/datasets/{dataset_id}/request-batches/{batch_id}` | 按 `batch_id` 查询批次裁定与各项当时的组合值 |
 | `POST` | `/datasets/{dataset_id}/requests/{request_id}/reversals` | 冲正一条已授权且未冲正的申请（按 `reversal_id` 幂等） |
@@ -858,6 +870,104 @@ curl -X POST http://localhost:8000/datasets/sales-2026/selection-plans \
 * 候选数为 0 或超过 12、`candidate_id` 重复或为空、`epsilon` / `delta` 越界、
   `value` 非正整数（含小数）等 → `422`。
 
+### 4.16 隐私成本归因（cost attribution，只读）
+
+在**不创建任何记录、不改变预留状态**的前提下，把一组**已授权且未冲正**申请
+「整组选入」造成的 epsilon 增量，按标准 **Shapley 值**分摊给组内每个申请。
+可用于解释「这一批申请各自占用了多少边际隐私成本」（RDP 转换余量会因组合而
+非可加，各申请的成本不能简单取自身投影）。
+
+```bash
+curl -X POST http://localhost:8000/datasets/sales-2026/cost-attributions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_ids": [
+      "req-20260924-0001",
+      "req-20260924-0002",
+      "req-20260924-0003"
+    ]
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `request_ids` | array | 必填，**1～10 个**、**互不重复**的 `request_id`（每个 1–200 字符）；顺序即响应逐项顺序，不影响数值 |
+
+**基线 / 占用口径**（与正式准入、预算视图、试算完全一致的 RDP 口径）：
+
+* **基线占用 `epsilon_baseline`**：本数据集内**除所选申请外**的全部未冲正
+  granted 申请，加上**当前未到期**的 granted 预留，一起组合后的投影 epsilon；
+  已拒绝 / 已冲正申请、已释放 / 已确认 / 已过期 / 被拒绝预留均不参与；
+* **全组占用 `epsilon_full_group`**：在基线之上再把**全部所选申请**一次性
+  组合进去后的投影 epsilon；
+* **组增量 `epsilon_increment = epsilon_full_group − epsilon_baseline`**
+  （不为负）。
+
+**分摊方法**：记 `V(S)` 为基线叠加所选子集 `S` 后用同一套 RDP 网格算出的
+投影 epsilon。对每个所选申请 `i`，穷举其余申请的全部子集
+`S ⊆ N\\{i}`，按其加入各子集的边际增量与标准 Shapley 权重取平均：
+
+```
+phi_i = Σ_{S ⊆ N\\{i}} [ |S|! · (n−1−|S|)! / n! ] · ( V(S∪{i}) − V(S) )
+```
+
+由于 RDP 组合逐 order 可加、`V` 单调，每个边际增量与每份分摊都**非负**，且
+Shapley 权重保证 **`Σ_i phi_i = V(N) − V(∅) = epsilon_increment`**（浮点舍入
+误差内）。纯 ε-DP 申请在任何子集里的边际增量恒等于自身 epsilon，因此其分摊
+精确等于自身 epsilon；近似 DP 申请之间则按 Shapley 权重公平分摊 RDP 转换的
+保守余量。成功返回 `200`：
+
+```json
+{
+  "dataset_id": "sales-2026",
+  "generated_at": "2026-09-24T12:00:00.000000Z",
+  "request_count": 3,
+  "request_ids": ["req-20260924-0001", "req-20260924-0002", "req-20260924-0003"],
+  "epsilon_cap": 1.0,
+  "epsilon_baseline": 0.0,
+  "epsilon_full_group": 0.3561844401133079,
+  "epsilon_increment": 0.3561844401133079,
+  "rdp_best_order_baseline": 8192.0,
+  "rdp_best_order_full_group": 8192.0,
+  "attributed_total_epsilon": 0.35618444011330785,
+  "attributions": [
+    {"request_id": "req-20260924-0001", "epsilon": 0.1, "delta": 1e-8,
+     "attributed_epsilon": 0.10309222005665396},
+    {"request_id": "req-20260924-0002", "epsilon": 0.2, "delta": 1e-8,
+     "attributed_epsilon": 0.20309222005665392},
+    {"request_id": "req-20260924-0003", "epsilon": 0.05, "delta": 0.0,
+     "attributed_epsilon": 0.05}
+  ]
+}
+```
+
+字段说明：
+
+* `epsilon_baseline` / `epsilon_full_group`：基线占用与全组选入占用，均附
+  取得该投影的最优 RDP order（`rdp_best_order_baseline` /
+  `rdp_best_order_full_group`）；
+* `attributions[]`：按请求传入顺序逐项给出申请自身的 `epsilon` / `delta` 与
+  Shapley 分摊值 `attributed_epsilon`；
+* `attributed_total_epsilon`：逐项分摊之和，**在数值误差内等于
+  `epsilon_full_group − epsilon_baseline`**（即 `epsilon_increment`）。
+
+语义与边界：
+
+* **严格只读、无幂等键**：本接口不写任何表（不产生申请、预留、批次、转拨或
+  冲正记录），也**不触发预留惰性清扫**（与 release-forecast、selection plan
+  同为纯 SELECT）；**每次调用都按实时账本重算**——账本被其他申请 / 预留 /
+  冲正 / 转拨改变后，再次归因结果随之变化；
+* 归因是对当前账本的一次性解释，不锁定额度、不改变任何申请状态，也不构成
+  对未来准入的承诺；
+* 数据集中不存在所选申请（含被其他数据集拥有的 `request_id`）→
+  `404 request_not_found`；所选申请为 `rejected` →
+  `409 request_not_granted`；所选申请**已冲正** →
+  `409 request_already_reversed`（按请求顺序报告首个不合法 ID）；
+* 数据集不存在 → `404 dataset_not_found`；
+* `request_ids` 为空或超过 10 个、存在重复 ID、ID 为空或超长 → `422`。
+
 ---
 
 ## 5. RDP 组合会计（核算口径）
@@ -903,6 +1013,14 @@ curl -X POST http://localhost:8000/datasets/sales-2026/selection-plans \
    **同一条** RDP 投影（纯 ε-DP 仍走精确可加分支），仅保留投影不超 cap 的
    可行子集并按「总 value → 投影 epsilon → 候选 ID 升序列表字典序」选优；
    全程纯 SELECT，不落任何记录、不做惰性清扫，重复调用按最新账本重算。
+
+8. 成本归因（cost attribution）同样**不改变任何集合、纯 SELECT**：以「其余
+   未冲正已授权申请 ∪ 当前未到期预留」为基线组合曲线，对所选 1～10 个申请
+   穷举全部 2ⁿ 个子集的 RDP 投影 `V(S)`（与准入完全相同的口径与纯 ε 分支），
+   再按标准 Shapley 权重对边际增量 `V(S∪{i}) − V(S)` 取平均，把全组增量
+   `V(N) − V(∅)` 分摊到每个所选申请；组合曲线逐 order 可加保证各边际非负，
+   Shapley 权重之和为 1，故逐项分摊之和恰等于全组与基线两次占用之差（舍入
+   误差内）。
 
 特殊情形：
 
@@ -953,6 +1071,10 @@ curl -X POST http://localhost:8000/datasets/sales-2026/selection-plans \
 * 只读的候选组合试算（selection plan）与释放预测一样**不进入写临界区、不开启
   写事务**：仅用纯 SELECT 读取未冲正申请与未到期预留后在进程内穷举子集，
   与任何并发写互不阻塞，也绝不改变数据库状态。
+* 只读的隐私成本归因（cost attribution）同样**不进入写临界区、不开启写事务、
+  不做惰性清扫**：纯 SELECT 读取未冲正已授权申请与未到期预留后，在进程内
+  穷举所选申请的全部子集并按 Shapley 权重分摊增量；与并发写互不阻塞，绝不
+  改变数据库状态，每次调用都按实时账本重算。
 
 ---
 
@@ -1037,6 +1159,16 @@ confirmed、其他有效预留继续计入并仍能阻止超额新申请、到�
 清扫、重复调用结果稳定）、账本变化后再次试算按最新占用重算、12 项边界、缺失
 数据集 404、0 / 13 项、重复 `candidate_id`、`value` 非正整数（含小数）与
 epsilon/delta 越界 422。
+
+隐私成本归因测试另覆盖：单申请分摊等于其相对基线的全部增量、逐项分摊之和等于
+全组与基线两次占用之差（含混合纯 / 近似 DP 基线）、分摊结果与独立暴力 Shapley
+穷举（直接调用 `rdp.py` 组合）逐项一致、纯 ε-DP 下分摊恰为自身 epsilon 且与
+传入顺序无关、基线包含其他未冲正申请与未到期预留且全组占用等于预算视图的实时
+占用、已冲正申请与已过期预留不参与且不被本接口清扫（状态保持 granted、重复调用
+结果一致）、严格只读（不产生任何记录、占用不变）、账本变化后按最新占用重算、
+10 项边界，以及缺失数据集 404、缺失申请 404、已拒绝 409 request_not_granted、
+已冲正 409 request_already_reversed、空 / 11 项 / 重复 ID / 空 ID / 超长 ID
+422。
 
 ---
 

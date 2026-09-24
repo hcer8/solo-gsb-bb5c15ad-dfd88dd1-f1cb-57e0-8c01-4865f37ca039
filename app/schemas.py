@@ -649,5 +649,92 @@ class SelectionPlanView(BaseModel):
     rdp_best_order: float
 
 
+# -------------------------------------------------------- cost attributions --
+
+
+# A read-only Shapley attribution enumerates every subset of the group, so the
+# selected request count is capped tightly (2**10 = 1024 subsets at most).
+MIN_ATTRIBUTION_REQUESTS = 1
+MAX_ATTRIBUTION_REQUESTS = 10
+
+
+class CostAttributionRequest(BaseModel):
+    """1-10 unique granted, non-reversed requests to attribute as one group."""
+
+    request_ids: list[str] = Field(
+        ...,
+        min_length=MIN_ATTRIBUTION_REQUESTS,
+        max_length=MAX_ATTRIBUTION_REQUESTS,
+        examples=[["req-20260924-0001", "req-20260924-0002"]],
+        description="1-10 client-chosen, mutually distinct request_ids.  Each "
+        "must identify a granted, not-yet-reversed request of this dataset.",
+    )
+
+    @field_validator("request_ids")
+    @classmethod
+    def _valid_request_ids(cls, v: list[str]) -> list[str]:
+        for request_id in v:
+            if not 1 <= len(request_id) <= 200:
+                raise ValueError(
+                    "each request_id must be a string of 1-200 characters"
+                )
+        return v
+
+    @model_validator(mode="after")
+    def _unique_request_ids(self) -> "CostAttributionRequest":
+        seen: set[str] = set()
+        for request_id in self.request_ids:
+            if request_id in seen:
+                raise ValueError(
+                    f"request_id {request_id!r} occurs more than once; "
+                    "request_id must be unique within the request"
+                )
+            seen.add(request_id)
+        return self
+
+
+class CostAttributionItem(BaseModel):
+    """One selected request with its Shapley share of the group increment."""
+
+    request_id: str
+    epsilon: float
+    delta: float
+    # Standard Shapley-weighted average of this request's marginal epsilon
+    # increments over the coalitions of the other selected requests.
+    attributed_epsilon: float
+
+
+class CostAttributionView(BaseModel):
+    """Read-only Shapley attribution of one group of granted requests.
+
+    Nothing is persisted and no reservation is swept: every call recomputes
+    against the live ledger.  The baseline occupancy composes every *other*
+    granted, non-reversed request together with the currently non-expired
+    granted reservations; the full-group occupancy additionally composes every
+    selected request.  Each selected request is charged its standard Shapley
+    share of the resulting epsilon increment, so the per-item shares sum (up to
+    floating-point error) to ``epsilon_full_group - epsilon_baseline``.
+    """
+
+    dataset_id: str
+    generated_at: datetime
+    request_count: int
+    # Selected ids, echoed in the request's supplied order.
+    request_ids: list[str]
+    epsilon_cap: float
+    # Occupancy with every *other* non-reversed granted request and the
+    # currently non-expired granted reservations, but without the group.
+    epsilon_baseline: float
+    # Occupancy once every selected request is additionally composed in.
+    epsilon_full_group: float
+    # epsilon_full_group - epsilon_baseline (the attributed group increment).
+    epsilon_increment: float
+    rdp_best_order_baseline: float
+    rdp_best_order_full_group: float
+    # Sum of the per-item attributed epsilon values.
+    attributed_total_epsilon: float
+    attributions: list[CostAttributionItem]
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
